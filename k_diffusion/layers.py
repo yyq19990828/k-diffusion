@@ -14,6 +14,18 @@ from . import sampling, utils
 
 
 def dct(x):
+    """
+    Computes the Discrete Cosine Transform (DCT) of the input tensor.
+    
+    Parameters:
+    x (torch.Tensor): Input tensor which can be 3D, 4D, or 5D.
+    
+    Returns:
+    torch.Tensor: The DCT of the input tensor.
+    
+    Raises:
+    ValueError: If the input tensor has unsupported dimensionality.
+    """
     if x.ndim == 3:
         return df.dct(x)
     if x.ndim == 4:
@@ -25,6 +37,19 @@ def dct(x):
 
 @lru_cache
 def freq_weight_1d(n, scales=0, dtype=None, device=None):
+    """
+    频率权重计算函数。
+    该函数生成一个一维的频率权重张量，用于后续的计算。
+
+    参数:
+        n (int): 权重的数量。
+        scales (float, 可选): 权重的最大缩放比例。默认为0，不进行缩放。
+        dtype (torch.dtype, 可选): 返回张量的数据类型。默认为None，使用默认类型。
+        device (torch.device, 可选): 返回张量的设备。默认为None，使用默认设备。
+
+    返回:
+        torch.Tensor: 计算得到的频率权重张量。
+    """
     ramp = torch.linspace(0.5 / n, 0.5, n, dtype=dtype, device=device)
     weights = -torch.log2(ramp)
     if scales >= 1:
@@ -34,6 +59,22 @@ def freq_weight_1d(n, scales=0, dtype=None, device=None):
 
 @lru_cache
 def freq_weight_nd(shape, scales=0, dtype=None, device=None):
+    """
+    freq_weight_nd 函数
+    该函数根据给定的形状生成多维频率权重张量。
+
+    参数：
+        shape (tuple): 生成的权重张量的形状。
+        scales (float, optional): 缩放因子，默认为 0。
+        dtype (torch.dtype, optional): 返回张量的数据类型，默认为 None。
+        device (torch.device, optional): 返回张量的设备，默认为 None。
+
+    返回：
+        torch.Tensor: 生成的多维频率权重张量。
+
+    示例：
+        >>> weights = freq_weight_nd((3, 3), scales=1.0)
+    """
     indexers = [[slice(None) if i == j else None for j in range(len(shape))] for i in range(len(shape))]
     weights = [freq_weight_1d(n, scales, dtype, device)[ix] for n, ix in zip(shape, indexers)]
     return reduce(torch.minimum, weights)
