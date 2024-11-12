@@ -77,6 +77,7 @@ class DecoderBlock(nn.Module):
         super().__init__()
         if skip:
             ch_in *= 2
+        self.skip = skip
         self.attn = attn if attn else nn.Identity()
         self.adaptive_norm = AdaptiveGrpNorm(ch_out, emd_dim)
         self.block1 = nn.Sequential(
@@ -105,11 +106,12 @@ class Conv(nn.Conv2d):
         return super().forward(x)
     
 class Unet(nn.Module):
-    def __init__(self, c_ori=3, c_begin=192, n_blocks=3, stacks=2, attn=None):
+    def __init__(self, c_ori=3, c_begin=192, n_blocks=4, stacks=2, attn=None):
         super().__init__()
         channel_list = [c_ori] + [(c_begin * (1+i)) for i in range(stacks)]
-        channel_list1 = channel_list[1:] + [channel_list[-1]]
-        print(channel_list)
+        channel_list1 = list(reversed(channel_list[1:] + [channel_list[-1]]))
+        # print(channel_list)
+        # print(channel_list1)
         self.n_blocks = n_blocks
         self.stacks = stacks
         self.in_channels = self.out_channels = c_ori
@@ -118,25 +120,52 @@ class Unet(nn.Module):
         self.attn = nn.Identity()
         self.encoder = nn.ModuleList([])
         self.decoder = nn.ModuleList([])
+        self.out = nn.Sequential(nn.GroupNorm(32, c_begin), 
+                                nn.SiLU(), 
+                                nn.Conv2d(c_begin, c_ori, 3, 1, 1))
 
         for i in range(stacks):
-            self.encoder.append(self.make_enc_stack(channel_list[i], channel_list[i+1], attn))
-            # print(self.encoder)
-            self.decoder.append(self.make_dec_stack(channel_list1[i+1], channel_list1[i], attn))
+            if i==0:
+                self.encoder.append(self.make_enc_stack1(channel_list[i], channel_list[i+1], attn=None))
+            else:
+                self.encoder.append(self.make_enc_stack2(channel_list[i], channel_list[i+1], attn=self.attn))
         
-        # print(self.encoder)
+        for i in range(stacks+1):
+            if i==0:
+                self.decoder.append(nn.ModuleList([DecoderBlock(channel_list1[i], channel_list1[i], 768)]))
+            elif i==1:
+                self.decoder.append(self.make_dec_stack(channel_list1[i-1], channel_list1[i], attn=self.attn))
+            elif i==stacks:
+                self.decoder.append(self.make_dec_stack(channel_list1[i-1], channel_list1[i], upsample=True ,attn=None))
+            else:
+                self.decoder.append(self.make_dec_stack(channel_list1[i-1], channel_list1[i], upsample=True, attn=self.attn))
+        # print(self.decoder)
     
-    def make_enc_stack(self, c_in, c_out, attn):
+    def make_enc_stack1(self, c_in, c_out, attn):
+        '''1+n'''
+        # EncoderBlock(c_in, c_out, 768, downsample=False, attn=attn)
             
-        return nn.ModuleList([EncoderBlock(c_in, c_out, 768) if c_in > 3 else Conv(c_in, c_out, 3,1,1)] +
-            [EncoderBlock(c_out, c_out, 768, attn=attn) for _ in range(self.n_blocks-2)] + 
-            [EncoderBlock(c_out, c_out, 768, downsample=True, attn=attn)])
-    
-    def make_dec_stack(self, c_in, c_out, attn):
+        return nn.ModuleList([Conv(c_in, c_out, 3,1,1)] +
+            [EncoderBlock(c_out, c_out, 768, attn=attn) for _ in range(self.n_blocks-1)] 
+            )
 
-        return nn.ModuleList([DecoderBlock(c_in, c_in, 768, skip=True, attn=attn) for _ in range(self.n_blocks -1)] + 
-            [DecoderBlock(c_in, c_in, 768, skip=True, attn=attn) ] + 
-            [DecoderBlock(c_out, c_in, 768, upsample=True)])
+    def make_enc_stack2(self, c_in, c_out, attn):
+        '''down+降维A+2A'''
+        # EncoderBlock(c_in, c_out, 768, downsample=False, attn=attn)
+            
+        return nn.ModuleList([EncoderBlock(c_in, c_in, 768, downsample=True)] +
+            [EncoderBlock(c_in, c_out, 768, attn=attn)] +
+            [EncoderBlock(c_out, c_out, 768, attn=attn) for _ in range(self.n_blocks-2)] 
+            )
+    
+    def make_dec_stack(self, c_in, c_out, upsample=False, attn=None):
+        # DecoderBlock(c_in, c_in, 768, skip=True, upsample=False, attn=attn)
+
+        return nn.ModuleList(
+            [DecoderBlock(c_in, c_in, 768, skip=False, upsample=upsample)] + 
+            [DecoderBlock(c_in, c_out, 768, skip=True, attn=attn) ] + 
+            [DecoderBlock(c_out, c_out, 768, skip=True, attn=attn) for _ in range(self.n_blocks-1)]
+        )
 
     def test(self, x, emd):
         skip = []
@@ -145,18 +174,20 @@ class Unet(nn.Module):
             sub_skip = []
             for enc in stack:
                 x = enc(x, emd)
-                sub_skip.append(x)
+                skip.append(x)
                 skipsize.append(x.size())
-            sub_skip.append(None)
-            skip.append(sub_skip)
         print(skipsize)
-        for sub_skip, stack in zip(reversed(skip), reversed(self.decoder)):
-            for x_skip, dec in zip(reversed(sub_skip), reversed(stack)):
-                if x_skip is not None:
-                    print(dec)
+        # print(skip)
+        for stack in self.decoder:
+            for dec in stack:
+                if dec.skip:
                     print(x.shape)
-                    print(x_skip.shape)
+                    print(skip[-1].shape)
+                    x_skip = skip.pop()
                     print()
+                    if x_skip.size(1) != x.size(1):
+                        conv1X1 = nn.Conv2d(x_skip.size(1), x.size(1), 1, 1, 0)
+                        x_skip = conv1X1(x_skip)
                     x = torch.cat([x, x_skip], dim=1)
                     x = dec(x, emd)
                     print(x.shape)
@@ -167,12 +198,25 @@ class Unet(nn.Module):
         print('-----------------')
         print(x.shape)
         print('-----------------')
- 
-    def forward(self, x):
-        for layer in self.encoder:
-            x = layer(x)
-        for layer in self.decoder:
-            x = layer(x)
+
+    def forward(self, x, emd):
+        skip = []
+        for stack in self.encoder:
+            sub_skip = []
+            for enc in stack:
+                x = enc(x, emd)
+                skip.append(x)
+        for stack in self.decoder:
+            for dec in stack:
+                if dec.skip:
+                    x_skip = skip.pop()
+                    if x_skip.size(1) != x.size(1):
+                        conv1X1 = nn.Conv2d(x_skip.size(1), x.size(1), 1, 1, 0)
+                        x_skip = conv1X1(x_skip)
+                    x = torch.cat([x, x_skip], dim=1)
+                    x = dec(x, emd)
+                else:
+                    x = dec(x, emd)
         return self.out(x)
     
 
@@ -186,4 +230,5 @@ if __name__ == '__main__':
     # print(y.shape)
     # print(out)
     unet = Unet()
-    unet.test(x, emd)
+    x = unet(x, emd)
+    print(x.shape)
