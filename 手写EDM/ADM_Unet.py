@@ -45,10 +45,89 @@ class Downsample(nn.Module):
     def forward(self, x):
         return F.interpolate(x, scale_factor=1/self.scale_factor, mode='bilinear', align_corners=False)
 
+class MHSA_2D(nn.Module):
+    """
+    Multi-Head Self-Attention Module for Image Feature Maps.
+    
+    Args:
+        in_channels (int): Number of input channels.
+        num_heads (int): Number of attention heads.
+        reduction (int): Reduction ratio for intermediate channels. Default: 8.
+    """
+    def __init__(self, in_channels, num_heads=8, reduction=8):
+        super(MHSA_2D, self).__init__()
+        
+        assert in_channels % num_heads == 0, "in_channels must be divisible by num_heads"
+        self.in_channels = in_channels
+        self.num_heads = num_heads
+        self.head_dim = in_channels // num_heads  # Dimension per head
+        
+        # self.reduction = reduction
+        # self.inter_channels = (in_channels // reduction) // num_heads
+        
+        # Single convolution to generate Q, K, V
+        # Output channels = 3 * in_channels for Q, K, V
+        self.qkv_conv = nn.Conv2d(in_channels, 3 * in_channels, kernel_size=1, bias=False)
+        
+        # Output projection
+        self.out_conv = nn.Conv2d(in_channels, in_channels, kernel_size=1, bias=False)
+        
+        # Learnable scaling parameter
+        self.gamma = nn.Parameter(torch.zeros(1))
+        
+        # Optional: LayerNorm for stabilization
+        # self.norm = nn.LayerNorm(in_channels)
+    
+    def forward(self, x):
+        """
+        Forward pass of the Multi-Head Self-Attention module.
+        
+        Args:
+            x (Tensor): Input feature maps of shape (B, C, H, W)
+        
+        Returns:
+            out (Tensor): Self-attended feature maps.
+        """
+        B, C, H, W = x.size()
+        
+        # Generate Q, K, V
+        qkv = self.qkv_conv(x)  # (B, 3C, H, W)
+        q, k, v = torch.chunk(qkv, chunks=3, dim=1)  # Each of shape (B, C, H, W)
+        
+        # Reshape and split into heads
+        # New shape: (B, num_heads, C_per_head, H*W)
+        def reshape_to_heads(tensor):
+            return tensor.view(B, self.num_heads, self.head_dim, H * W)
+        
+        q = reshape_to_heads(q)  # (B, num_heads, C_per_head, H*W)
+        k = reshape_to_heads(k)  # (B, num_heads, C_per_head, H*W)
+        v = reshape_to_heads(v)  # (B, num_heads, C_per_head, H*W)
+        
+        # Compute attention scores
+        # Attention scores: (B, num_heads, H*W, H*W)
+        attn_scores = torch.einsum('bnch,bnck->bnhk', q, k)  # Alternative to bmm for multiple heads
+        attn_scores = attn_scores / (self.head_dim ** 0.5)
+        attn_weights = F.softmax(attn_scores, dim=-1)  # (B, num_heads, H*W, H*W)
+        
+        # Weighted sum of V
+        # (B, num_heads, C_per_head, H*W)
+        attn_output = torch.einsum('bnhw,bnch->bncw', attn_weights, v)
+        
+        # Reshape back to (B, C, H, W)
+        attn_output = attn_output.contiguous().view(B, C, H, W)
+        
+        # Output projection
+        attn_output = self.out_conv(attn_output)
+        
+        # Apply scaling and residual connection
+        out = self.gamma * attn_output + x
+        
+        return out
+
 class EncoderBlock(nn.Module):
     def __init__(self, ch_in, ch_out, emd_dim, downsample=False, attn=None) -> None:
         super().__init__()
-        self.attn = attn if attn else nn.Identity()
+        self.attn = attn(ch_out) if attn else nn.Identity()
         self.adaptive_norm = AdaptiveGrpNorm(ch_out, emd_dim)
         self.block1 = nn.Sequential(
             nn.GroupNorm(32, ch_in),
@@ -78,7 +157,7 @@ class DecoderBlock(nn.Module):
         if skip:
             ch_in *= 2
         self.skip = skip
-        self.attn = attn if attn else nn.Identity()
+        self.attn = attn(ch_out) if attn else nn.Identity()
         self.adaptive_norm = AdaptiveGrpNorm(ch_out, emd_dim)
         self.block1 = nn.Sequential(
             nn.GroupNorm(32, ch_in),
@@ -106,7 +185,7 @@ class Conv(nn.Conv2d):
         return super().forward(x)
     
 class Unet(nn.Module):
-    def __init__(self, c_ori=3, c_begin=192, n_blocks=4, stacks=2, attn=None):
+    def __init__(self, c_ori=3, c_begin=192, n_blocks=4, stacks=2, attn=MHSA_2D):
         super().__init__()
         channel_list = [c_ori] + [(c_begin * (1+i)) for i in range(stacks)]
         channel_list1 = list(reversed(channel_list[1:] + [channel_list[-1]]))
@@ -117,7 +196,7 @@ class Unet(nn.Module):
         self.in_channels = self.out_channels = c_ori
         # self.num_layers = num_layers
         # self.num_filters = num_filters
-        self.attn = nn.Identity()
+        self.attn = attn
         self.encoder = nn.ModuleList([])
         self.decoder = nn.ModuleList([])
         self.out = nn.Sequential(nn.GroupNorm(32, c_begin), 
@@ -224,8 +303,8 @@ if __name__ == '__main__':
     emd_layer = time_embedding(512, 768)
     t = torch.arange(0, 5, 1)
     emd = emd_layer(t)
-    x = torch.randn(5, 3, 64, 64)
-    # enc = EncoderBlock(64, 128, 768, downsample=True)
+    x = torch.randn(5, 3, 28, 28)
+    # enc = EncoderBlock(64, 128, 768, downsample=True,attn=MHSA_2D)
     # y = enc(x, emd)
     # print(y.shape)
     # print(out)
